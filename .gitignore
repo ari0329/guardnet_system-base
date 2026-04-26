@@ -1,0 +1,17 @@
+.env
+*.h5
+*.pt
+__pycache__/
+myenv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.dll
+*.so
+*.exe
+*.zip
+*.tar
+*.gz
+logs/
