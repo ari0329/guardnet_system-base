@@ -7,3 +7,4 @@ streamlit>=1.32
 pandas>=2.0
 plotly>=5.18
 python-dotenv>=1.0
+gdown>=4.7
