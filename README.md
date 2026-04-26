@@ -202,8 +202,15 @@ MIT – free to use, modify, and distribute.
 
 py -3.11 -m venv myenv
 myenv\Scripts\activate
-pip install ultralytics
-pip install tensorflow
-pip install tensorboard
-pip install opencv-python 
-pip install opencv-python numpy ultralytics streamlit pandas plotly Pillow 
+pip install tensorflow==2.15.0
+python -m pip install python-dotenv
+pip install opencv-python
+pip install "numpy<2" 
+python train.py --data_dir ./data --epochs 30
+python demo.py --source 0
+git lfs install
+git lfs track "*.h5"
+git add .gitattributes
+git add models/guardnet_model.h5
+git commit -m "Add trained model via LFS"
+git push
