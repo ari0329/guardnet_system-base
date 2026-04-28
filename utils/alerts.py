@@ -1,8 +1,7 @@
 """
-GuardNet – Alert & Logging System
-Handles console alerts, sound alerts, simulated email alerts, and CSV logging.
+GuardNet – Alert & Logging System (Production)
+Dynamic email input, clip attachment, no hardcoded addresses.
 """
-
 import os
 import sys
 import csv
@@ -10,149 +9,167 @@ import time
 import smtplib
 import threading
 from datetime import datetime
-from email.mime.text import MIMEText
+from email.mime.text      import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base      import MIMEBase
+from email                import encoders
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import (
-    LOG_FILE, LOG_DIR,
-    ENABLE_SOUND_ALERT, ENABLE_EMAIL_ALERT,
-    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_RECIPIENT,
-    ALERT_COOLDOWN_SECONDS, VIOLENCE_THRESHOLD
-)
+from config.config import LOG_FILE, LOG_DIR, ALERT_COOLDOWN_SECONDS
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-# ─── CSV Logger ───────────────────────────────────────────────────────────────
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+
 
 class EventLogger:
-    """Thread-safe CSV logger for violence detection events."""
+    FIELDNAMES = ["timestamp", "camera_id", "confidence", "clip_path"]
 
-    FIELDNAMES = ["timestamp", "confidence", "source", "notes"]
-
-    def __init__(self, log_path: str = LOG_FILE):
-        self.log_path = log_path
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    def __init__(self, path=LOG_FILE):
+        self.path  = path
         self._lock = threading.Lock()
-        self._init_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                csv.DictWriter(
+                    f, fieldnames=self.FIELDNAMES
+                ).writeheader()
 
-    def _init_file(self):
-        if not os.path.exists(self.log_path):
-            with open(self.log_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
-                writer.writeheader()
-
-    def log(self, confidence: float, source: str = "camera", notes: str = ""):
+    def log(self, confidence: float,
+            camera_id: str = "cam0",
+            clip_path: str = "") -> dict:
         row = {
             "timestamp" : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "camera_id" : camera_id,
             "confidence": f"{confidence:.4f}",
-            "source"    : source,
-            "notes"     : notes,
+            "clip_path" : clip_path,
         }
         with self._lock:
-            with open(self.log_path, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
-                writer.writerow(row)
+            with open(self.path, "a", newline="") as f:
+                csv.DictWriter(
+                    f, fieldnames=self.FIELDNAMES
+                ).writerow(row)
         return row
 
+    def read_all(self):
+        try:
+            with open(self.path, "r") as f:
+                return list(csv.DictReader(f))
+        except Exception:
+            return []
 
-# ─── Alert Manager ────────────────────────────────────────────────────────────
 
 class AlertManager:
-    """
-    Fires alerts (console / sound / email) with a cooldown to avoid spam.
-    Thread-safe.
-    """
-
     def __init__(self):
-        self._last_alert_time = 0.0
-        self._lock = threading.Lock()
+        self._last  = {}       # camera_id → last alert timestamp
+        self._lock  = threading.Lock()
         self.logger = EventLogger()
 
-    # ── Public ────────────────────────────────────────────────────────────────
-
-    def trigger(self, confidence: float, source: str = "camera"):
-        """Call this every time violence is detected."""
+    def trigger(self, confidence: float,
+                camera_id:   str = "cam0",
+                alert_email: str = "",
+                clip_path:   str = ""):
         now = time.time()
         with self._lock:
-            if now - self._last_alert_time < ALERT_COOLDOWN_SECONDS:
+            if now - self._last.get(camera_id, 0) < ALERT_COOLDOWN_SECONDS:
                 return
-            self._last_alert_time = now
+            self._last[camera_id] = now
 
-        # Fire all alert types (non-blocking where possible)
-        self._console_alert(confidence, source)
-        row = self.logger.log(confidence, source)
+        # Console alert
+        self._console(confidence, camera_id)
 
-        if ENABLE_SOUND_ALERT:
-            threading.Thread(target=self._sound_alert, daemon=True).start()
+        # Log to CSV
+        row = self.logger.log(confidence, camera_id, clip_path)
 
-        if ENABLE_EMAIL_ALERT:
+        # Email alert (only if email + SMTP configured)
+        if alert_email and SMTP_USER and SMTP_PASS:
             threading.Thread(
-                target=self._email_alert, args=(confidence, source, row["timestamp"]),
-                daemon=True
+                target=self._email,
+                args=(confidence, camera_id,
+                      row["timestamp"], alert_email, clip_path),
+                daemon=True,
             ).start()
 
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _console_alert(self, confidence: float, source: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        bar = "█" * int(confidence * 20)
+    def _console(self, conf, cam):
+        ts  = datetime.now().strftime("%H:%M:%S")
+        bar = "█" * int(conf * 20)
         print(
-            f"\n{'='*60}\n"
-            f"  ⚠️  VIOLENCE DETECTED  [{ts}]\n"
-            f"  Source     : {source}\n"
-            f"  Confidence : {bar} {confidence*100:.1f}%\n"
-            f"  Threshold  : {VIOLENCE_THRESHOLD*100:.0f}%\n"
-            f"{'='*60}\n"
+            f"\n{'='*55}\n"
+            f"  ⚠️  VIOLENCE DETECTED [{ts}]  Camera: {cam}\n"
+            f"  Confidence: {bar} {conf*100:.1f}%\n"
+            f"{'='*55}\n"
         )
 
-    def _sound_alert(self):
-        """Cross-platform terminal bell; replace with pygame/playsound if desired."""
+    def _email(self, conf, cam, ts, recipient, clip_path):
         try:
-            # Try system bell
-            sys.stdout.write("\a")
-            sys.stdout.flush()
-            # On Linux with 'beep' installed:
-            os.system("beep -f 880 -l 200 2>/dev/null || true")
-        except Exception:
-            pass
-
-    def _email_alert(self, confidence: float, source: str, timestamp: str):
-        """Simulated SMTP email alert (set ENABLE_EMAIL_ALERT=True in config)."""
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = f"[GuardNet] ⚠️ Violence Detected – {timestamp}"
+            msg            = MIMEMultipart()
+            msg["Subject"] = f"[GuardNet] ⚠️ Violence Detected – {ts}"
             msg["From"]    = SMTP_USER
-            msg["To"]      = ALERT_RECIPIENT
+            msg["To"]      = recipient
 
             body = f"""
-            <html><body>
-            <h2 style="color:red;">⚠️ GuardNet – Violence Alert</h2>
-            <table>
-              <tr><td><b>Timestamp</b></td><td>{timestamp}</td></tr>
-              <tr><td><b>Source</b></td><td>{source}</td></tr>
-              <tr><td><b>Confidence</b></td><td>{confidence*100:.1f}%</td></tr>
-              <tr><td><b>Threshold</b></td><td>{VIOLENCE_THRESHOLD*100:.0f}%</td></tr>
-            </table>
-            <p>Please review the footage immediately.</p>
-            </body></html>
-            """
+            <html>
+            <body style="font-family:Arial;background:#0d1117;
+                         color:#e6edf3;padding:20px">
+              <h2 style="color:#f85149">⚠️ GuardNet – Violence Alert</h2>
+              <table style="border-collapse:collapse;width:100%">
+                <tr>
+                  <td style="padding:8px;color:#8892a4"><b>Timestamp</b></td>
+                  <td>{ts}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px;color:#8892a4"><b>Camera</b></td>
+                  <td>{cam}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px;color:#8892a4"><b>Confidence</b></td>
+                  <td>{conf*100:.1f}%</td>
+                </tr>
+              </table>
+              <p style="color:#f85149;margin-top:16px">
+                Please review the footage immediately.
+              </p>
+            </body>
+            </html>"""
+
             msg.attach(MIMEText(body, "html"))
 
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-                server.starttls()
-                server.login(SMTP_USER, SMTP_PASS)
-                server.sendmail(SMTP_USER, ALERT_RECIPIENT, msg.as_string())
-            print("[INFO] Email alert sent.")
+            # Attach clip if it exists
+            if clip_path and os.path.exists(clip_path):
+                with open(clip_path, "rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header(
+                        "Content-Disposition",
+                        f'attachment; filename='
+                        f'"{os.path.basename(clip_path)}"'
+                    )
+                    msg.attach(part)
+
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+                s.starttls()
+                s.login(SMTP_USER, SMTP_PASS)
+                s.sendmail(SMTP_USER, recipient, msg.as_string())
+
+            print(f"[INFO] Email alert sent to {recipient}")
+
         except Exception as e:
-            print(f"[WARN] Email alert failed: {e}")
+            print(f"[WARN] Email failed: {e}")
 
 
-# ─── Singleton ────────────────────────────────────────────────────────────────
-
-_alert_manager: AlertManager | None = None
+# Singleton
+_alert_mgr = None
 
 def get_alert_manager() -> AlertManager:
-    global _alert_manager
-    if _alert_manager is None:
-        _alert_manager = AlertManager()
-    return _alert_manager
+    global _alert_mgr
+    if _alert_mgr is None:
+        _alert_mgr = AlertManager()
+    return _alert_mgr
