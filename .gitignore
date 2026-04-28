@@ -1,5 +1,4 @@
 .env
-*.h5
 *.pt
 myenv/
 myenv311/
