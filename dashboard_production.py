@@ -652,7 +652,7 @@ if recent:
             f"<div class='alert-card'>"
             f"⚠ {r.get('timestamp','')}<br>"
             f"📷 {r.get('camera_id','')}&nbsp;&nbsp;"
-            f"🎯 {float(r.get('confidence',0))*100:.1f}%"
+            f"🎯 {float(r.get('confidence') or 0)*100:.1f}%"
             f"</div>"
         )
     alert_log_ph.markdown(alerts_html, unsafe_allow_html=True)

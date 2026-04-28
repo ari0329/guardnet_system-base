@@ -22,11 +22,56 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import (
-    MODEL_PATH, CNN_BACKBONE, LSTM_UNITS,
-    SEQUENCE_LENGTH, FRAME_SIZE, NUM_CLASSES,
-    BATCH_SIZE, EPOCHS, VALIDATION_SPLIT, LEARNING_RATE,
-)
+
+# ── Import config — supports BOTH config styles ────────────────────────────
+# Style A: FRAME_SIZE = (224, 224)
+# Style B: FRAME_WIDTH = 224, FRAME_HEIGHT = 224  (your current config)
+from config.config import MODEL_PATH, SEQUENCE_LENGTH
+
+try:
+    from config.config import CNN_BACKBONE
+except ImportError:
+    CNN_BACKBONE = "MobileNetV2"
+
+try:
+    from config.config import LSTM_UNITS
+except ImportError:
+    LSTM_UNITS = 256
+
+try:
+    from config.config import NUM_CLASSES
+except ImportError:
+    NUM_CLASSES = 2
+
+try:
+    from config.config import BATCH_SIZE
+except ImportError:
+    BATCH_SIZE = 4
+
+try:
+    from config.config import EPOCHS
+except ImportError:
+    EPOCHS = 30
+
+try:
+    from config.config import VALIDATION_SPLIT
+except ImportError:
+    VALIDATION_SPLIT = 0.20
+
+try:
+    from config.config import LEARNING_RATE
+except ImportError:
+    LEARNING_RATE = 1e-4
+
+# Resolve FRAME_SIZE from whichever style your config uses
+try:
+    from config.config import FRAME_SIZE
+except ImportError:
+    try:
+        from config.config import FRAME_WIDTH, FRAME_HEIGHT
+        FRAME_SIZE = (FRAME_HEIGHT, FRAME_WIDTH)   # (H, W)
+    except ImportError:
+        FRAME_SIZE = (224, 224)   # universal fallback
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -67,9 +112,9 @@ def build_model(
     )
 
     # ── Spatial Feature Extraction (per frame) ────────────────────────────
-    x = layers.TimeDistributed(base_cnn,                      name="td_backbone")(seq_input)
-    x = layers.TimeDistributed(layers.BatchNormalization(),   name="td_bn")(x)
-    x = layers.TimeDistributed(layers.Dropout(0.3),           name="td_drop")(x)
+    x = layers.TimeDistributed(base_cnn,                    name="td_backbone")(seq_input)
+    x = layers.TimeDistributed(layers.BatchNormalization(), name="td_bn")(x)
+    x = layers.TimeDistributed(layers.Dropout(0.3),         name="td_drop")(x)
 
     # ── Temporal Reasoning ────────────────────────────────────────────────
     x = layers.Bidirectional(
@@ -90,7 +135,6 @@ def build_model(
     out = layers.Dense(num_classes, activation="softmax", name="output")(x)
 
     model = models.Model(inputs=seq_input, outputs=out, name="GuardNet")
-
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
         loss="sparse_categorical_crossentropy",
@@ -100,20 +144,13 @@ def build_model(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Fine-Tune Helper  ← THIS WAS MISSING IN YOUR OLD FILE
+# Fine-Tune Helper
 # ══════════════════════════════════════════════════════════════════════════════
 
 def unfreeze_top_layers(model, num_layers: int = 30):
     """
     Unfreeze the last N layers of the CNN backbone for fine-tuning (Phase 2).
-    Recompiles the model with a lower learning rate.
-
-    Args:
-        model      : compiled Keras model returned by build_model()
-        num_layers : how many backbone layers to unfreeze (default 30)
-
-    Returns:
-        model  (recompiled, ready to continue training)
+    Recompiles with a 10× lower learning rate.
     """
     import tensorflow as tf
 
@@ -123,13 +160,11 @@ def unfreeze_top_layers(model, num_layers: int = 30):
             layer.trainable = True
         print(f"  [unfreeze] Unfroze top {num_layers} backbone layers.")
     except Exception as e:
-        print(f"  [unfreeze] Warning: {e} — skipping fine-tune phase.")
+        print(f"  [unfreeze] Warning — {e}. Skipping fine-tune phase.")
         return model
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(
-            learning_rate=LEARNING_RATE / 10   # 10× smaller LR for fine-tuning
-        ),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE / 10),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
@@ -137,8 +172,7 @@ def unfreeze_top_layers(model, num_layers: int = 30):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Legacy train() — kept for backwards compatibility with old train.py
-# (new train.py calls model.fit directly with generators)
+# Legacy train()  — kept for old train.py compatibility
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train(
@@ -150,8 +184,8 @@ def train(
     val_split:       float = VALIDATION_SPLIT,
 ):
     """
-    Legacy in-memory training.
-    ⚠️  Use the new train.py with VideoDataGenerator for large datasets.
+    Legacy in-memory training (loads all data at once).
+    Use new train.py with VideoDataGenerator for large datasets.
     """
     import tensorflow as tf
 
@@ -168,8 +202,8 @@ def train(
             restore_best_weights=True, verbose=1,
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=3,
-            min_lr=1e-6, verbose=1,
+            monitor="val_loss", factor=0.5,
+            patience=3, min_lr=1e-6, verbose=1,
         ),
     ]
 
@@ -191,8 +225,8 @@ def train(
 
 class GuardNetInference:
     """
-    Loads a saved .h5 model and runs real-time inference.
-    Thread-safe — safe to call from a background detection thread.
+    Loads a saved .h5 model and runs real-time frame-by-frame inference.
+    Thread-safe — safe to call from background detection threads.
     """
 
     def __init__(self, model_path: str = MODEL_PATH):
@@ -204,19 +238,17 @@ class GuardNetInference:
         import tensorflow as tf
         self.model = tf.keras.models.load_model(model_path)
 
-        # Warm-up pass — JIT-compiles graph ops on first call
-        dummy = np.zeros(
-            (1, SEQUENCE_LENGTH, *FRAME_SIZE, 3), dtype=np.float32
-        )
+        # Warm-up pass — compiles TF graph ops
+        dummy = np.zeros((1, SEQUENCE_LENGTH, *FRAME_SIZE, 3), dtype=np.float32)
         self.model.predict(dummy, verbose=0)
         print(f"[GuardNet] Model loaded ✓  ({model_path})")
 
     def predict(self, sequence: np.ndarray) -> float:
         """
         Args:
-            sequence : float32 array  (1, SEQ_LEN, H, W, 3)  normalised [0, 1]
+            sequence : float32  (1, SEQ_LEN, H, W, 3)  normalised [0, 1]
         Returns:
-            Violence probability in [0.0, 1.0]
+            Violence probability  float in [0.0, 1.0]
         """
         if sequence.ndim == 4:
             sequence = sequence[np.newaxis]        # add batch dim
