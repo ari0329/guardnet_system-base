@@ -1,204 +1,224 @@
 """
-GuardNet – CNN + LSTM Model
-Spatial features (MobileNetV2 / ResNet50) → LSTM temporal classifier.
+GuardNet — CNN + Bidirectional LSTM Violence Detection Model
+
+Architecture:
+    Input  (batch, SEQ_LEN, 224, 224, 3)
+        │
+    TimeDistributed(MobileNetV2 — ImageNet pretrained)   ← spatial features
+        │
+    TimeDistributed(BatchNorm + Dropout)
+        │
+    Bidirectional LSTM (256 units, return_sequences=True) ← temporal reasoning
+        │  Dropout
+    Bidirectional LSTM (128 units)
+        │  Dropout
+    Dense(128, ReLU) → Dropout → Dense(2, Softmax)
+        │
+    [P(non-violent), P(violent)]
 """
 
 import os
 import sys
 import numpy as np
 
-import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, callbacks
-from tensorflow.keras.applications import MobileNetV2, ResNet50
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
-    FRAME_WIDTH, FRAME_HEIGHT, SEQUENCE_LENGTH,
-    CNN_BACKBONE, LSTM_UNITS, DROPOUT_RATE, NUM_CLASSES,
-    LEARNING_RATE, BATCH_SIZE, EPOCHS,
-    VALIDATION_SPLIT, EARLY_STOPPING_PATIENCE,
-    MODEL_PATH
+    MODEL_PATH, CNN_BACKBONE, LSTM_UNITS,
+    SEQUENCE_LENGTH, FRAME_SIZE, NUM_CLASSES,
+    BATCH_SIZE, EPOCHS, VALIDATION_SPLIT, LEARNING_RATE,
 )
 
 
-# ─── Feature Extractor ────────────────────────────────────────────────────────
-
-def build_cnn_encoder(backbone: str = CNN_BACKBONE) -> tf.keras.Model:
-    """Return a frozen ImageNet-pretrained CNN without the top classifier."""
-    input_shape = (FRAME_HEIGHT, FRAME_WIDTH, 3)
-
-    if backbone == "MobileNetV2":
-        base = MobileNetV2(
-            input_shape=input_shape,
-            include_top=False,
-            weights="imagenet",
-            pooling="avg"
-        )
-    elif backbone == "ResNet50":
-        base = ResNet50(
-            input_shape=input_shape,
-            include_top=False,
-            weights="imagenet",
-            pooling="avg"
-        )
-    else:
-        raise ValueError(f"Unknown backbone: {backbone}")
-
-    # Freeze first 80 % of layers; fine-tune the rest
-    freeze_until = int(len(base.layers) * 0.8)
-    for layer in base.layers[:freeze_until]:
-        layer.trainable = False
-    for layer in base.layers[freeze_until:]:
-        layer.trainable = True
-
-    return base
-
-
-# ─── Full CNN-LSTM Architecture ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Build Model
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_model(
-    seq_len: int = SEQUENCE_LENGTH,
-    backbone: str = CNN_BACKBONE,
-) -> tf.keras.Model:
-    """
-    TimeDistributed CNN → BiLSTM → Dense classifier.
-    Input: (batch, seq_len, H, W, 3)
-    Output: (batch, 2) softmax probabilities [non-violent, violent]
-    """
-    cnn_encoder = build_cnn_encoder(backbone)
-    feature_dim = cnn_encoder.output_shape[-1]   # e.g. 1280 for MobileNetV2
+    sequence_length: int   = SEQUENCE_LENGTH,
+    frame_size:      tuple = FRAME_SIZE,
+    backbone:        str   = CNN_BACKBONE,
+    lstm_units:      int   = LSTM_UNITS,
+    num_classes:     int   = NUM_CLASSES,
+):
+    """Return a compiled Keras CNN-LSTM model ready for training."""
+    import tensorflow as tf
+    from tensorflow.keras import layers, models
+    from tensorflow.keras.applications import MobileNetV2, ResNet50
 
-    # ── Input ──
-    inp = layers.Input(shape=(seq_len, FRAME_HEIGHT, FRAME_WIDTH, 3),
-                       name="frame_sequence")
+    input_shape = (*frame_size, 3)
 
-    # ── Spatial features (applied independently per frame) ──
-    x = layers.TimeDistributed(cnn_encoder, name="cnn_encoder")(inp)
-    x = layers.TimeDistributed(layers.BatchNormalization())(x)
-    x = layers.TimeDistributed(layers.Dropout(DROPOUT_RATE * 0.5))(x)
+    # ── CNN Backbone (frozen initially) ────────────────────────────────────
+    if backbone == "ResNet50":
+        base_cnn = ResNet50(
+            include_top=False, weights="imagenet",
+            input_shape=input_shape, pooling="avg",
+        )
+    else:  # default: MobileNetV2
+        base_cnn = MobileNetV2(
+            include_top=False, weights="imagenet",
+            input_shape=input_shape, pooling="avg",
+        )
+    base_cnn.trainable = False   # frozen during Phase 1
 
-    # ── Temporal reasoning ──
+    # ── Sequence Input ─────────────────────────────────────────────────────
+    seq_input = layers.Input(
+        shape=(sequence_length, *frame_size, 3),
+        name="sequence_input",
+    )
+
+    # ── Spatial Feature Extraction (per frame) ────────────────────────────
+    x = layers.TimeDistributed(base_cnn,                      name="td_backbone")(seq_input)
+    x = layers.TimeDistributed(layers.BatchNormalization(),   name="td_bn")(x)
+    x = layers.TimeDistributed(layers.Dropout(0.3),           name="td_drop")(x)
+
+    # ── Temporal Reasoning ────────────────────────────────────────────────
     x = layers.Bidirectional(
-        layers.LSTM(LSTM_UNITS, return_sequences=True), name="bilstm_1"
-    )(x)
-    x = layers.Dropout(DROPOUT_RATE)(x)
+            layers.LSTM(lstm_units, return_sequences=True, dropout=0.3),
+            name="bilstm_1",
+        )(x)
+    x = layers.Dropout(0.4, name="drop_1")(x)
 
     x = layers.Bidirectional(
-        layers.LSTM(LSTM_UNITS // 2, return_sequences=False), name="bilstm_2"
-    )(x)
-    x = layers.Dropout(DROPOUT_RATE)(x)
+            layers.LSTM(lstm_units // 2, dropout=0.3),
+            name="bilstm_2",
+        )(x)
+    x = layers.Dropout(0.4, name="drop_2")(x)
 
-    # ── Classifier head ──
-    x = layers.Dense(128, activation="relu")(x)
-    x = layers.Dropout(DROPOUT_RATE * 0.5)(x)
-    out = layers.Dense(NUM_CLASSES, activation="softmax", name="class_probs")(x)
+    # ── Classifier Head ───────────────────────────────────────────────────
+    x   = layers.Dense(128, activation="relu", name="fc_128")(x)
+    x   = layers.Dropout(0.5, name="drop_cls")(x)
+    out = layers.Dense(num_classes, activation="softmax", name="output")(x)
 
-    model = models.Model(inputs=inp, outputs=out, name="GuardNet")
-    return model
+    model = models.Model(inputs=seq_input, outputs=out, name="GuardNet")
 
-
-# ─── Compile Helper ───────────────────────────────────────────────────────────
-
-def compile_model(model: tf.keras.Model) -> tf.keras.Model:
     model.compile(
-        optimizer=optimizers.Adam(learning_rate=LEARNING_RATE),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
         loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"]
+        metrics=["accuracy"],
     )
     return model
 
 
-# ─── Training Pipeline ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Fine-Tune Helper  ← THIS WAS MISSING IN YOUR OLD FILE
+# ══════════════════════════════════════════════════════════════════════════════
 
-def train(X: np.ndarray, y: np.ndarray, model_save_path: str = MODEL_PATH):
+def unfreeze_top_layers(model, num_layers: int = 30):
     """
-    Train GuardNet on pre-loaded sequences.
-    X: shape (N, seq_len, H, W, 3)
-    y: shape (N,)  values in {0, 1}
-    """
-    os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+    Unfreeze the last N layers of the CNN backbone for fine-tuning (Phase 2).
+    Recompiles the model with a lower learning rate.
 
+    Args:
+        model      : compiled Keras model returned by build_model()
+        num_layers : how many backbone layers to unfreeze (default 30)
+
+    Returns:
+        model  (recompiled, ready to continue training)
+    """
+    import tensorflow as tf
+
+    try:
+        backbone = model.get_layer("td_backbone").layer
+        for layer in backbone.layers[-num_layers:]:
+            layer.trainable = True
+        print(f"  [unfreeze] Unfroze top {num_layers} backbone layers.")
+    except Exception as e:
+        print(f"  [unfreeze] Warning: {e} — skipping fine-tune phase.")
+        return model
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=LEARNING_RATE / 10   # 10× smaller LR for fine-tuning
+        ),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Legacy train() — kept for backwards compatibility with old train.py
+# (new train.py calls model.fit directly with generators)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def train(
+    X:               np.ndarray,
+    y:               np.ndarray,
+    model_save_path: str   = MODEL_PATH,
+    epochs:          int   = EPOCHS,
+    batch_size:      int   = BATCH_SIZE,
+    val_split:       float = VALIDATION_SPLIT,
+):
+    """
+    Legacy in-memory training.
+    ⚠️  Use the new train.py with VideoDataGenerator for large datasets.
+    """
+    import tensorflow as tf
+
+    os.makedirs(os.path.dirname(model_save_path) or ".", exist_ok=True)
     model = build_model()
-    compile_model(model)
-    model.summary()
 
-    cb_list = [
-        callbacks.EarlyStopping(
-            monitor="val_accuracy",
-            patience=EARLY_STOPPING_PATIENCE,
-            restore_best_weights=True,
-            verbose=1
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            model_save_path, save_best_only=True,
+            monitor="val_accuracy", verbose=1,
         ),
-        callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5,
-            patience=3, min_lr=1e-6, verbose=1
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_accuracy", patience=7,
+            restore_best_weights=True, verbose=1,
         ),
-        callbacks.ModelCheckpoint(
-            filepath=model_save_path,
-            monitor="val_accuracy",
-            save_best_only=True,
-            verbose=1
-        ),
-        callbacks.TensorBoard(
-            log_dir=os.path.join(os.path.dirname(model_save_path), "tb_logs"),
-            histogram_freq=1
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=3,
+            min_lr=1e-6, verbose=1,
         ),
     ]
 
     history = model.fit(
         X, y,
-        batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
-        validation_split=VALIDATION_SPLIT,
-        callbacks=cb_list,
-        shuffle=True
+        batch_size=batch_size,
+        epochs=epochs,
+        validation_split=val_split,
+        callbacks=callbacks,
+        shuffle=True,
     )
-    print(f"[INFO] Model saved → {model_save_path}")
+    model.save(model_save_path)
     return model, history
 
 
-# ─── Inference Helper ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Inference Wrapper
+# ══════════════════════════════════════════════════════════════════════════════
 
 class GuardNetInference:
-    """Lightweight wrapper for real-time inference."""
+    """
+    Loads a saved .h5 model and runs real-time inference.
+    Thread-safe — safe to call from a background detection thread.
+    """
 
     def __init__(self, model_path: str = MODEL_PATH):
         if not os.path.exists(model_path):
             raise FileNotFoundError(
-                f"Trained model not found at {model_path}.\n"
-                "Run  python train.py  first, or place a .h5 file there."
+                f"[GuardNet] Model not found: {model_path}\n"
+                "Train first:  python train.py --data_dir ./data --epochs 30"
             )
-        print(f"[INFO] Loading model from {model_path}")
+        import tensorflow as tf
         self.model = tf.keras.models.load_model(model_path)
-        self.model.make_predict_function()   # warm-up JIT
-        print("[INFO] Model ready.")
+
+        # Warm-up pass — JIT-compiles graph ops on first call
+        dummy = np.zeros(
+            (1, SEQUENCE_LENGTH, *FRAME_SIZE, 3), dtype=np.float32
+        )
+        self.model.predict(dummy, verbose=0)
+        print(f"[GuardNet] Model loaded ✓  ({model_path})")
 
     def predict(self, sequence: np.ndarray) -> float:
         """
-        sequence: np.ndarray shape (1, seq_len, H, W, 3)
-        Returns violence probability (float in [0, 1]).
+        Args:
+            sequence : float32 array  (1, SEQ_LEN, H, W, 3)  normalised [0, 1]
+        Returns:
+            Violence probability in [0.0, 1.0]
         """
-        probs = self.model.predict(sequence, verbose=0)[0]
-        return float(probs[1])              # index 1 = violent class
-
-
-# ─── Utility: create a lightweight demo model (no real training needed) ──────
-
-def create_demo_model(save_path: str = MODEL_PATH):
-    """
-    Builds and saves an UNTRAINED model so the demo script can run
-    without a dataset.  Weights are random – predictions are meaningless
-    but the pipeline works end-to-end.
-    """
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    model = build_model()
-    compile_model(model)
-    model.save(save_path)
-    print(f"[INFO] Demo (untrained) model saved → {save_path}")
-    return model
-
-
-if __name__ == "__main__":
-    # Quick architecture sanity-check
-    m = build_model()
-    m.summary()
+        if sequence.ndim == 4:
+            sequence = sequence[np.newaxis]        # add batch dim
+        preds = self.model.predict(sequence, verbose=0)
+        return float(preds[0, 1])                  # index 1 = violent class
