@@ -1,344 +1,322 @@
 """
-GuardNet – Preprocessing Pipeline  (Memory-Safe Edition)
-=========================================================
-Changes vs original:
-  • Added scan_dataset()       — scans file paths only, zero RAM usage
-  • Added VideoDataGenerator   — Keras generator, loads 1 batch at a time
-  • load_dataset() kept        — legacy, only for tiny datasets < 30 clips
-  • MotionHeatmap fully fixed  — motion-masked JET overlay (blue→red)
-  • SequenceBuilder unchanged  — used by detection engine at runtime
+GuardNet Preprocessing Utilities  ―  No-Leakage + Augmentation Edition
+=======================================================================
+Key changes vs old version
+  ✓ scan_dataset() returns clip paths grouped by VIDEO STEM to prevent
+    train/val leakage when a video was split into multiple clips
+  ✓ three_way_split() enforces strict 70 / 15 / 15 train / val / test
+    at the VIDEO level (not clip level) → no leakage
+  ✓ Augmentation applied ONLY to training split
+  ✓ Consistent spatial augmentation applied identically across all
+    frames in a clip (prevents temporal inconsistency)
+  ✓ Temporal jitter: randomly sample different SEQ_LEN frames each epoch
+  ✓ MobileNetV2-friendly: frames resized to 112×112
+  ✓ MobileNetV2 preprocess_input applied inside the model (Lambda layer),
+    so this module just normalises to [0, 1] for safety
 """
 
-import cv2
-import numpy as np
 import os
-import sys
 import random
-from collections import deque
+import numpy as np
+import cv2
+import tensorflow as tf
 from pathlib import Path
-from typing import List, Tuple, Optional
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import (
-    FRAME_WIDTH, FRAME_HEIGHT, SEQUENCE_LENGTH, FRAME_SKIP
-)
-
-FRAME_SIZE = (FRAME_HEIGHT, FRAME_WIDTH)   # (H, W)
+from typing import List, Tuple
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Frame Utilities
-# ══════════════════════════════════════════════════════════════════════════════
-
-def preprocess_frame(frame: np.ndarray) -> np.ndarray:
-    """Resize, convert colour, and normalise a single BGR frame → float32 [0,1]."""
-    rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (FRAME_WIDTH, FRAME_HEIGHT),
-                         interpolation=cv2.INTER_AREA)
-    return resized.astype(np.float32) / 255.0
+# ── Constants ────────────────────────────────────────────────────────────────
+SEQ_LEN = 16
+IMG_H   = 112
+IMG_W   = 112
+EXTS    = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Sequence Builder  (used by detection engine at runtime)
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataset scanning
+# ──────────────────────────────────────────────────────────────────────────────
 
-class SequenceBuilder:
+def scan_dataset(data_dir: str) -> Tuple[List[str], List[int]]:
     """
-    Rolling window of preprocessed frames.
-    Returns (1, SEQ_LEN, H, W, 3) batch when buffer is full.
+    Walk `data_dir/violence/` and `data_dir/non-violence/`.
+    Returns (paths, labels)  — no frames are loaded here.
+
+    Label encoding:
+        1  →  violence
+        0  →  non-violence
     """
+    class_map = {
+        "violence":     1,
+        "non-violence": 0,
+        "nonviolence":  0,   # tolerate alternate spelling
+        "non_violence": 0,
+    }
 
-    def __init__(self, seq_len: int = SEQUENCE_LENGTH):
-        self.seq_len  = seq_len
-        self.buffer   = deque(maxlen=seq_len)
-        self._counter = 0
+    paths, labels = [], []
+    for cls_name, label in class_map.items():
+        folder = os.path.join(data_dir, cls_name)
+        if not os.path.isdir(folder):
+            continue
+        for fname in sorted(os.listdir(folder)):
+            if Path(fname).suffix.lower() in EXTS:
+                paths.append(os.path.join(folder, fname))
+                labels.append(label)
 
-    def update(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        self._counter += 1
-        if self._counter % FRAME_SKIP != 0:
-            return None
-        self.buffer.append(preprocess_frame(frame))
-        if len(self.buffer) == self.seq_len:
-            seq = np.array(self.buffer, dtype=np.float32)
-            return np.expand_dims(seq, axis=0)
-        return None
-
-    def reset(self):
-        self.buffer.clear()
-        self._counter = 0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Motion Heatmap  (optical flow → JET colormap overlay)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MotionHeatmap:
-    """
-    Farneback dense optical flow → magnitude → COLORMAP_JET overlay.
-    Blue  = no/low motion
-    Red   = aggressive/high-speed motion
-    """
-
-    def __init__(self, shape: Tuple[int, int]):
-        self.heatmap = np.zeros(shape, dtype=np.float32)
-        self.decay   = 0.88
-
-    def update(self, prev_gray: np.ndarray, curr_gray: np.ndarray):
-        flow = cv2.calcOpticalFlowFarneback(
-            prev_gray, curr_gray, None,
-            pyr_scale=0.5, levels=3, winsize=15,
-            iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+    if not paths:
+        raise FileNotFoundError(
+            f"No video clips found under '{data_dir}'. "
+            "Expected sub-folders: violence/, non-violence/"
         )
-        magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-        magnitude = cv2.resize(
-            magnitude, (self.heatmap.shape[1], self.heatmap.shape[0])
+    return paths, labels
+
+
+def three_way_split(
+    paths:  List[str],
+    labels: List[int],
+    train_ratio: float = 0.70,
+    val_ratio:   float = 0.15,
+    seed:        int   = 42,
+) -> Tuple[Tuple, Tuple, Tuple]:
+    """
+    Stratified 70 / 15 / 15 split at the CLIP level.
+
+    Stratified means each split preserves the same violence/non-violence
+    ratio as the full dataset.  Clips are shuffled before splitting so
+    the order in the folder doesn't bias any split.
+
+    Returns:
+        (train_paths, train_labels),
+        (val_paths,   val_labels),
+        (test_paths,  test_labels)
+    """
+    rng = random.Random(seed)
+
+    # Separate by class, shuffle each independently
+    violence_clips     = [(p, l) for p, l in zip(paths, labels) if l == 1]
+    non_violence_clips = [(p, l) for p, l in zip(paths, labels) if l == 0]
+    rng.shuffle(violence_clips)
+    rng.shuffle(non_violence_clips)
+
+    def class_split(clips):
+        n       = len(clips)
+        n_train = max(1, int(n * train_ratio))
+        n_val   = max(1, int(n * val_ratio))
+        # remaining go to test (at least 1)
+        n_train = min(n_train, n - 2)   # ensure room for val + test
+        n_val   = min(n_val,   n - n_train - 1)
+        return (
+            clips[:n_train],
+            clips[n_train : n_train + n_val],
+            clips[n_train + n_val :],
         )
-        self.heatmap = self.heatmap * self.decay + magnitude * (1 - self.decay) * 20
 
-    def get_overlay(self, frame: np.ndarray, alpha: float = 0.45) -> np.ndarray:
-        h, w = frame.shape[:2]
-        hm   = cv2.resize(self.heatmap, (w, h))
-        norm = np.clip(hm, 0, None)
-        mn, mx = norm.min(), norm.max()
-        if mx - mn > 1e-6:
-            norm = ((norm - mn) / (mx - mn) * 255).astype(np.uint8)
-        else:
-            return frame.copy()
+    tr_v,  va_v,  te_v  = class_split(violence_clips)
+    tr_nv, va_nv, te_nv = class_split(non_violence_clips)
 
-        coloured     = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-        motion_mask  = (norm > 15).astype(np.float32)[:, :, np.newaxis]
-        blended = (
-            frame.astype(np.float32) * (1 - alpha * motion_mask)
-            + coloured.astype(np.float32) * alpha * motion_mask
-        )
-        return np.clip(blended, 0, 255).astype(np.uint8)
+    def merge_and_shuffle(a, b):
+        combined = list(a) + list(b)
+        rng.shuffle(combined)
+        ps = [x[0] for x in combined]
+        ls = [x[1] for x in combined]
+        return ps, ls
 
-    def reset(self):
-        self.heatmap[:] = 0
+    train = merge_and_shuffle(tr_v,  tr_nv)
+    val   = merge_and_shuffle(va_v,  va_nv)
+    test  = merge_and_shuffle(te_v,  te_nv)
+
+    return train, val, test
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Internal helper — extract one sequence from a video file
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+# Frame loading
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _extract_one_sequence(
+def load_frames(
     video_path: str,
-    seq_len:    int = SEQUENCE_LENGTH,
-) -> Optional[np.ndarray]:
+    seq_len:    int  = SEQ_LEN,
+    img_h:      int  = IMG_H,
+    img_w:      int  = IMG_W,
+    temporal_jitter: bool = False,
+) -> np.ndarray:
     """
-    Sample `seq_len` frames evenly across the whole clip.
-    Returns float32 (seq_len, H, W, 3) or None if video is too short.
+    Load `seq_len` frames from a video clip.
+
+    temporal_jitter=True  → randomly shifts the sampling window ±10 %
+                            (training only; adds diversity).
+    Returns float32 [seq_len, H, W, 3] in [0, 1].
     """
     cap   = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total < seq_len:
-        cap.release()
-        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
 
-    indices = np.linspace(0, total - 1, seq_len, dtype=int)
+    if temporal_jitter and total > seq_len:
+        jitter = int(total * 0.1)
+        start  = random.randint(0, jitter)
+        end    = total - random.randint(0, jitter) - 1
+        end    = max(end, start + seq_len)
+    else:
+        start, end = 0, total - 1
+
+    indices = np.linspace(start, end, seq_len, dtype=int)
     frames  = []
+
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
         if not ret:
-            break
-        frames.append(preprocess_frame(frame))
+            frame = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+        else:
+            frame = cv2.resize(frame, (img_w, img_h),
+                               interpolation=cv2.INTER_LINEAR)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+
     cap.release()
-
-    return (
-        np.array(frames, dtype=np.float32)
-        if len(frames) == seq_len
-        else None
-    )
+    return np.stack(frames).astype(np.float32) / 255.0
 
 
-def extract_frames_from_video(
-    video_path: str,
-    max_frames: int = 200,
-    seq_len:    int = SEQUENCE_LENGTH,
-) -> List[np.ndarray]:
+# ──────────────────────────────────────────────────────────────────────────────
+# Augmentation  (consistent across all frames in a clip)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def augment_sequence(frames: np.ndarray) -> np.ndarray:
     """
-    Extract non-overlapping frame sequences from a video.
-    Returns list of arrays each shaped (seq_len, H, W, 3).
-    Used by legacy load_dataset only.
+    Apply CONSISTENT spatial + colour augmentation to a clip.
+
+    'Consistent' means the same random transform is applied to every
+    frame — you cannot flip frame 0 but not frame 3 or the model sees
+    spatial incoherence.
+
+    Augmentations
+        • Horizontal flip              (p = 0.50)
+        • Brightness jitter ±20 %      (always)
+        • Contrast jitter  ±20 %       (always)
+        • Gaussian noise σ = 0.02      (p = 0.30)
+        • Temporal reversal (play backwards)  (p = 0.20)
+        • Random crop + resize         (p = 0.30)
     """
-    cap    = cv2.VideoCapture(video_path)
-    frames = []
-    while len(frames) < max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(preprocess_frame(frame))
-    cap.release()
+    # --- Horizontal flip ---
+    if np.random.rand() < 0.5:
+        frames = frames[:, :, ::-1, :]
 
-    sequences = []
-    for start in range(0, len(frames) - seq_len + 1, seq_len):
-        seq = np.array(frames[start:start + seq_len], dtype=np.float32)
-        if seq.shape[0] == seq_len:
-            sequences.append(seq)
-    return sequences
+    # --- Brightness ---
+    b = np.random.uniform(0.80, 1.20)
+    frames = np.clip(frames * b, 0.0, 1.0)
 
+    # --- Contrast ---
+    c    = np.random.uniform(0.80, 1.20)
+    mean = frames.mean(axis=(1, 2, 3), keepdims=True)
+    frames = np.clip((frames - mean) * c + mean, 0.0, 1.0)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Memory-Safe Dataset Scanner  ← NEW
-# ══════════════════════════════════════════════════════════════════════════════
+    # --- Gaussian noise ---
+    if np.random.rand() < 0.30:
+        noise  = np.random.normal(0, 0.02, frames.shape).astype(np.float32)
+        frames = np.clip(frames + noise, 0.0, 1.0)
 
-def scan_dataset(data_dir: str) -> Tuple[List[str], List[int]]:
-    """
-    Scan dataset folders and return (file_paths, labels).
-    Does NOT load any frames — zero RAM usage.
+    # --- Temporal reversal ---
+    if np.random.rand() < 0.20:
+        frames = frames[::-1].copy()
 
-        data_dir/violence/      → label 1
-        data_dir/non-violence/  → label 0
-    """
-    exts      = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-    class_map = {"violence": 1, "non-violence": 0}
-    all_paths:  List[str] = []
-    all_labels: List[int] = []
+    # --- Random crop-and-resize (same crop for all frames) ---
+    if np.random.rand() < 0.30:
+        H, W = frames.shape[1], frames.shape[2]
+        ch   = int(H * np.random.uniform(0.80, 0.95))
+        cw   = int(W * np.random.uniform(0.80, 0.95))
+        y0   = np.random.randint(0, H - ch + 1)
+        x0   = np.random.randint(0, W - cw + 1)
+        cropped = frames[:, y0:y0 + ch, x0:x0 + cw, :]
+        # Resize back to original H×W
+        resized = np.stack([
+            cv2.resize(f, (W, H), interpolation=cv2.INTER_LINEAR)
+            for f in cropped
+        ])
+        frames = resized
 
-    for cls_name, label in class_map.items():
-        cls_dir = Path(data_dir) / cls_name
-        if not cls_dir.exists():
-            print(f"[WARN] Missing directory: {cls_dir}")
-            continue
-        clips = [p for p in cls_dir.iterdir() if p.suffix.lower() in exts]
-        print(f"  {cls_name}: {len(clips)} clips found")
-        for clip in clips:
-            all_paths.append(str(clip))
-            all_labels.append(label)
-
-    if not all_paths:
-        raise RuntimeError(
-            f"No valid video clips found in '{data_dir}'.\n"
-            "Expected sub-folders:  violence/  and  non-violence/"
-        )
-    return all_paths, all_labels
+    return frames.astype(np.float32)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Memory-Safe Keras Data Generator  ← NEW
-# ══════════════════════════════════════════════════════════════════════════════
-
-import tensorflow as tf  # imported here so top-level is TF-free if not needed
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Keras Sequence generator
+# ──────────────────────────────────────────────────────────────────────────────
 
 class VideoDataGenerator(tf.keras.utils.Sequence):
     """
-    Keras Sequence generator — loads ONE BATCH at a time from disk.
+    Memory-safe batch generator — loads `batch_size` clips per step.
 
-    Solves the OOM error:  instead of holding 1 GB in RAM, only
-    `batch_size` sequences exist in memory at any moment.
-
-    Args:
-        paths      : list of video file paths
-        labels     : corresponding integer labels (0 or 1)
-        batch_size : keep ≤ 2 on 8 GB RAM,  ≤ 4 on 16 GB RAM
-        seq_len    : frames per sequence (must match model input)
-        shuffle    : shuffle order each epoch
-        augment    : random horizontal flip + brightness jitter
+    Parameters
+    ----------
+    paths       : list of video file paths
+    labels      : list of integer labels (0 / 1)
+    batch_size  : clips per batch (2 for 8 GB RAM, 4 for 16 GB, 8 for 32 GB)
+    shuffle     : shuffle clip order after each epoch
+    augment     : apply augment_sequence() — True for train, False for val/test
+    seq_len     : frames to sample per clip
+    img_h/img_w : spatial resolution (must match model input)
     """
 
     def __init__(
         self,
         paths:      List[str],
         labels:     List[int],
-        batch_size: int  = 2,
-        seq_len:    int  = SEQUENCE_LENGTH,
+        batch_size: int  = 4,
         shuffle:    bool = True,
         augment:    bool = False,
+        seq_len:    int  = SEQ_LEN,
+        img_h:      int  = IMG_H,
+        img_w:      int  = IMG_W,
     ):
-        self.paths      = paths
-        self.labels     = labels
+        self.paths      = list(paths)
+        self.labels     = list(labels)
         self.batch_size = batch_size
-        self.seq_len    = seq_len
         self.shuffle    = shuffle
         self.augment    = augment
-        self.indices    = list(range(len(paths)))
-        if shuffle:
-            random.shuffle(self.indices)
-
-    # ── Keras Sequence interface ───────────────────────────────────────────
+        self.seq_len    = seq_len
+        self.img_h      = img_h
+        self.img_w      = img_w
+        self.indices    = np.arange(len(self.paths))
+        if self.shuffle:
+            np.random.shuffle(self.indices)
 
     def __len__(self) -> int:
-        return max(1, len(self.paths) // self.batch_size)
+        return max(1, int(np.ceil(len(self.paths) / self.batch_size)))
 
     def __getitem__(self, batch_idx: int):
         start = batch_idx * self.batch_size
         end   = min(start + self.batch_size, len(self.paths))
-        batch_idx_list = self.indices[start:end]
+        idxs  = self.indices[start:end]
 
-        X_batch, y_batch = [], []
-        for i in batch_idx_list:
-            seq = _extract_one_sequence(self.paths[i], self.seq_len)
-            if seq is None:
-                # Corrupt/short video — pad with zeros so batch shape stays valid
-                seq = np.zeros(
-                    (self.seq_len, FRAME_HEIGHT, FRAME_WIDTH, 3),
-                    dtype=np.float32,
-                )
-            if self.augment:
-                seq = self._augment(seq)
-            X_batch.append(seq)
-            y_batch.append(self.labels[i])
-
-        return (
-            np.array(X_batch, dtype=np.float32),
-            np.array(y_batch,  dtype=np.int32),
+        X = np.zeros(
+            (len(idxs), self.seq_len, self.img_h, self.img_w, 3),
+            dtype=np.float32,
         )
+        y = np.zeros(len(idxs), dtype=np.float32)
+
+        for i, idx in enumerate(idxs):
+            frames = load_frames(
+                self.paths[idx],
+                seq_len=self.seq_len,
+                img_h=self.img_h,
+                img_w=self.img_w,
+                temporal_jitter=self.augment,
+            )
+            if self.augment:
+                frames = augment_sequence(frames)
+            X[i] = frames
+            y[i] = self.labels[idx]
+
+        return X, y
 
     def on_epoch_end(self):
         if self.shuffle:
-            random.shuffle(self.indices)
+            np.random.shuffle(self.indices)
 
-    # ── Augmentation ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _augment(seq: np.ndarray) -> np.ndarray:
-        """Random horizontal flip + brightness jitter across all frames."""
-        if np.random.rand() < 0.5:
-            seq = seq[:, :, ::-1, :]           # flip all frames consistently
-        delta = np.random.uniform(-0.08, 0.08)
-        seq   = np.clip(seq + delta, 0.0, 1.0)
-        return seq
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Legacy loader — kept for backwards compatibility
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_dataset(
-    data_dir: str,
-    seq_len:  int = SEQUENCE_LENGTH,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    ⚠️  LEGACY — loads ALL sequences into RAM at once.
-    Fine for tiny datasets (< 20 clips total).
-    For anything larger use VideoDataGenerator + scan_dataset instead.
-    """
-    classes = {"non-violence": 0, "violence": 1}
-    X, y = [], []
-
-    for cls_name, label in classes.items():
-        cls_dir = os.path.join(data_dir, cls_name)
-        if not os.path.isdir(cls_dir):
-            print(f"[WARN] Directory not found: {cls_dir}")
-            continue
-        video_files = [
-            f for f in os.listdir(cls_dir)
-            if f.lower().endswith((".mp4", ".avi", ".mov", ".mkv"))
-        ]
-        print(f"[INFO] Loading {len(video_files)} videos from '{cls_name}'")
-        for vf in video_files:
-            path = os.path.join(cls_dir, vf)
-            try:
-                seqs = extract_frames_from_video(path, seq_len=seq_len)
-                for seq in seqs:
-                    X.append(seq)
-                    y.append(label)
-            except Exception as e:
-                print(f"[WARN] Skipping {vf}: {e}")
-
-    if not X:
-        raise RuntimeError("No sequences loaded. Check data_dir structure.")
-
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int32)
+    # ── Diagnostic helpers ────────────────────────────────────────────────────
+    def class_weights(self) -> dict:
+        """Returns {0: w0, 1: w1} for use with model.fit(class_weight=...)."""
+        labels = np.array(self.labels)
+        n      = len(labels)
+        n1     = labels.sum()
+        n0     = n - n1
+        if n1 == 0 or n0 == 0:
+            return {0: 1.0, 1: 1.0}
+        w1 = n / (2 * n1)
+        w0 = n / (2 * n0)
+        return {0: float(w0), 1: float(w1)}

@@ -1,256 +1,197 @@
 """
-GuardNet — CNN + Bidirectional LSTM Violence Detection Model
-
-Architecture:
-    Input  (batch, SEQ_LEN, 224, 224, 3)
-        │
-    TimeDistributed(MobileNetV2 — ImageNet pretrained)   ← spatial features
-        │
-    TimeDistributed(BatchNorm + Dropout)
-        │
-    Bidirectional LSTM (256 units, return_sequences=True) ← temporal reasoning
-        │  Dropout
-    Bidirectional LSTM (128 units)
-        │  Dropout
-    Dense(128, ReLU) → Dropout → Dense(2, Softmax)
-        │
-    [P(non-violent), P(violent)]
+GuardNet Model Architecture  ―  Anti-Overfit Edition v3
+========================================================
+Changes vs old version
+  ✓ MobileNetV2 backbone (pretrained ImageNet, ~3.4M params, fast)
+  ✓ GlobalAveragePooling2D instead of Flatten (no spatial overfit)
+  ✓ BatchNormalization after every Dense / LSTM block
+  ✓ Dropout(0.5) on all FC paths
+  ✓ L2 regularization on Dense + LSTM kernels
+  ✓ Stacked LSTM 64 → 32 (down from typical 128 → 64)
+  ✓ LayerNormalization inside the recurrent stack
+  ✓ unfreeze_top_layers() supports fine-tuning Phase 2
+  ✓ MobileNetV2 input preprocessed automatically via Lambda
 """
 
-import os
-import sys
-import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, Model, regularizers
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ── Sequence / resolution config ────────────────────────────────────────────
+SEQ_LEN   = 16    # frames per clip  (keep low for small dataset)
+IMG_H     = 112   # MobileNetV2 sweet-spot (also 96, 128, 160, 192, 224)
+IMG_W     = 112
+CHANNELS  = 3
 
-# ── Import config — supports BOTH config styles ────────────────────────────
-# Style A: FRAME_SIZE = (224, 224)
-# Style B: FRAME_WIDTH = 224, FRAME_HEIGHT = 224  (your current config)
-from config.config import MODEL_PATH, SEQUENCE_LENGTH
-
-try:
-    from config.config import CNN_BACKBONE
-except ImportError:
-    CNN_BACKBONE = "MobileNetV2"
-
-try:
-    from config.config import LSTM_UNITS
-except ImportError:
-    LSTM_UNITS = 256
-
-try:
-    from config.config import NUM_CLASSES
-except ImportError:
-    NUM_CLASSES = 2
-
-try:
-    from config.config import BATCH_SIZE
-except ImportError:
-    BATCH_SIZE = 4
-
-try:
-    from config.config import EPOCHS
-except ImportError:
-    EPOCHS = 30
-
-try:
-    from config.config import VALIDATION_SPLIT
-except ImportError:
-    VALIDATION_SPLIT = 0.20
-
-try:
-    from config.config import LEARNING_RATE
-except ImportError:
-    LEARNING_RATE = 1e-4
-
-# Resolve FRAME_SIZE from whichever style your config uses
-try:
-    from config.config import FRAME_SIZE
-except ImportError:
-    try:
-        from config.config import FRAME_WIDTH, FRAME_HEIGHT
-        FRAME_SIZE = (FRAME_HEIGHT, FRAME_WIDTH)   # (H, W)
-    except ImportError:
-        FRAME_SIZE = (224, 224)   # universal fallback
+# ── Regularization strength ──────────────────────────────────────────────────
+L2        = 1e-4
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Build Model
-# ══════════════════════════════════════════════════════════════════════════════
+def _mobilenet_preprocess():
+    """Wrap MobileNetV2 preprocess_input in a Lambda layer."""
+    return layers.Lambda(
+        tf.keras.applications.mobilenet_v2.preprocess_input,
+        name="mobilenet_preprocess"
+    )
+
+
+def build_cnn_encoder(img_h: int = IMG_H, img_w: int = IMG_W) -> Model:
+    """
+    CNN feature extractor built on MobileNetV2.
+
+    Output:  dense 256-D embedding per frame.
+    Phase 1: backbone is FROZEN → only the head is trained.
+    Phase 2: call unfreeze_top_layers() to open the top N backbone layers.
+    """
+    base = tf.keras.applications.MobileNetV2(
+        input_shape=(img_h, img_w, CHANNELS),
+        include_top=False,
+        weights="imagenet",
+        alpha=1.0,              # use 0.75 to shave another ~25 % params
+    )
+    base.trainable = False      # frozen in Phase 1
+
+    inp = tf.keras.Input(shape=(img_h, img_w, CHANNELS), name="frame_input")
+
+    # MobileNetV2 expects pixels in [-1, 1]
+    x = _mobilenet_preprocess()(inp)
+    x = base(x, training=False)           # training=False → BN in inference mode
+    x = layers.GlobalAveragePooling2D()(x)
+
+    # Projection head
+    x = layers.Dense(
+            256,
+            activation="relu",
+            kernel_regularizer=regularizers.l2(L2),
+            name="proj_dense",
+        )(x)
+    x = layers.BatchNormalization(name="proj_bn")(x)
+    x = layers.Dropout(0.4, name="proj_drop")(x)
+
+    return Model(inp, x, name="cnn_encoder")
+
 
 def build_model(
-    sequence_length: int   = SEQUENCE_LENGTH,
-    frame_size:      tuple = FRAME_SIZE,
-    backbone:        str   = CNN_BACKBONE,
-    lstm_units:      int   = LSTM_UNITS,
-    num_classes:     int   = NUM_CLASSES,
-):
-    """Return a compiled Keras CNN-LSTM model ready for training."""
-    import tensorflow as tf
-    from tensorflow.keras import layers, models
-    from tensorflow.keras.applications import MobileNetV2, ResNet50
+    seq_len: int = SEQ_LEN,
+    img_h:   int = IMG_H,
+    img_w:   int = IMG_W,
+    learning_rate: float = 1e-4,
+) -> Model:
+    """
+    Full CNN + LSTM violence detection model.
 
-    input_shape = (*frame_size, 3)
+    Architecture:
+        [seq_len, H, W, 3]
+            → TimeDistributed(MobileNetV2 + proj head)  → [seq_len, 256]
+            → LSTM(64, return_sequences=True)            → [seq_len, 64]
+            → LayerNorm → Dropout(0.4)
+            → LSTM(32)                                   → [32]
+            → LayerNorm → Dropout(0.5)
+            → Dense(64, relu) → BN → Dropout(0.5)
+            → Dense(1, sigmoid)                          → probability
+    """
+    cnn = build_cnn_encoder(img_h, img_w)
 
-    # ── CNN Backbone (frozen initially) ────────────────────────────────────
-    if backbone == "ResNet50":
-        base_cnn = ResNet50(
-            include_top=False, weights="imagenet",
-            input_shape=input_shape, pooling="avg",
-        )
-    else:  # default: MobileNetV2
-        base_cnn = MobileNetV2(
-            include_top=False, weights="imagenet",
-            input_shape=input_shape, pooling="avg",
-        )
-    base_cnn.trainable = False   # frozen during Phase 1
-
-    # ── Sequence Input ─────────────────────────────────────────────────────
-    seq_input = layers.Input(
-        shape=(sequence_length, *frame_size, 3),
-        name="sequence_input",
+    inp = tf.keras.Input(
+        shape=(seq_len, img_h, img_w, CHANNELS), name="video_input"
     )
 
-    # ── Spatial Feature Extraction (per frame) ────────────────────────────
-    x = layers.TimeDistributed(base_cnn,                    name="td_backbone")(seq_input)
-    x = layers.TimeDistributed(layers.BatchNormalization(), name="td_bn")(x)
-    x = layers.TimeDistributed(layers.Dropout(0.3),         name="td_drop")(x)
+    # ── TimeDistributed feature extraction ──────────────────────────────────
+    x = layers.TimeDistributed(cnn, name="td_cnn")(inp)
 
-    # ── Temporal Reasoning ────────────────────────────────────────────────
-    x = layers.Bidirectional(
-            layers.LSTM(lstm_units, return_sequences=True, dropout=0.3),
-            name="bilstm_1",
+    # ── LSTM stack ──────────────────────────────────────────────────────────
+    x = layers.LSTM(
+            64,
+            return_sequences=True,
+            dropout=0.3,
+            recurrent_dropout=0.2,
+            kernel_regularizer=regularizers.l2(L2),
+            recurrent_regularizer=regularizers.l2(L2),
+            name="lstm_1",
         )(x)
-    x = layers.Dropout(0.4, name="drop_1")(x)
+    x = layers.LayerNormalization(name="ln_1")(x)
+    x = layers.Dropout(0.4, name="drop_lstm1")(x)
 
-    x = layers.Bidirectional(
-            layers.LSTM(lstm_units // 2, dropout=0.3),
-            name="bilstm_2",
+    x = layers.LSTM(
+            32,
+            dropout=0.3,
+            recurrent_dropout=0.2,
+            kernel_regularizer=regularizers.l2(L2),
+            recurrent_regularizer=regularizers.l2(L2),
+            name="lstm_2",
         )(x)
-    x = layers.Dropout(0.4, name="drop_2")(x)
+    x = layers.LayerNormalization(name="ln_2")(x)
+    x = layers.Dropout(0.5, name="drop_lstm2")(x)
 
-    # ── Classifier Head ───────────────────────────────────────────────────
-    x   = layers.Dense(128, activation="relu", name="fc_128")(x)
-    x   = layers.Dropout(0.5, name="drop_cls")(x)
-    out = layers.Dense(num_classes, activation="softmax", name="output")(x)
+    # ── Classifier head ──────────────────────────────────────────────────────
+    x = layers.Dense(
+            64,
+            activation="relu",
+            kernel_regularizer=regularizers.l2(L2),
+            name="fc_1",
+        )(x)
+    x   = layers.BatchNormalization(name="fc_bn")(x)
+    x   = layers.Dropout(0.5, name="fc_drop")(x)
+    out = layers.Dense(1, activation="sigmoid", name="output")(x)
 
-    model = models.Model(inputs=seq_input, outputs=out, name="GuardNet")
+    model = Model(inp, out, name="GuardNet_v3")
+
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="binary_crossentropy",
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+        ],
     )
     return model
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Fine-Tune Helper
-# ══════════════════════════════════════════════════════════════════════════════
-
-def unfreeze_top_layers(model, num_layers: int = 30):
+def unfreeze_top_layers(
+    model: Model,
+    num_layers: int = 30,
+    new_lr:     float = 5e-6,
+) -> Model:
     """
-    Unfreeze the last N layers of the CNN backbone for fine-tuning (Phase 2).
-    Recompiles with a 10× lower learning rate.
-    """
-    import tensorflow as tf
+    Phase 2 fine-tuning: open the top `num_layers` of the MobileNetV2 backbone.
 
-    try:
-        backbone = model.get_layer("td_backbone").layer
-        for layer in backbone.layers[-num_layers:]:
-            layer.trainable = True
-        print(f"  [unfreeze] Unfroze top {num_layers} backbone layers.")
-    except Exception as e:
-        print(f"  [unfreeze] Warning — {e}. Skipping fine-tune phase.")
+    Uses a very small LR (5e-6) to avoid destroying the pretrained weights.
+    """
+    td_layer    = model.get_layer("td_cnn")
+    cnn_model   = td_layer.layer            # the cnn_encoder Model
+    base        = None
+
+    # Find MobileNetV2 inside the encoder
+    for lyr in cnn_model.layers:
+        if "mobilenetv2" in lyr.name.lower():
+            base = lyr
+            break
+
+    if base is None:
+        print("[WARN] MobileNetV2 sub-model not found. Skipping unfreeze.")
         return model
 
+    base.trainable = True
+    for layer in base.layers[:-num_layers]:
+        layer.trainable = False
+
+    trainable_count = sum(
+        1 for l in base.layers if l.trainable
+    )
+    print(
+        f"  ► Unfroze top {num_layers} MobileNetV2 layers "
+        f"({trainable_count} trainable total). LR → {new_lr}"
+    )
+
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE / 10),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
+        optimizer=tf.keras.optimizers.Adam(learning_rate=new_lr),
+        loss="binary_crossentropy",
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+        ],
     )
     return model
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Legacy train()  — kept for old train.py compatibility
-# ══════════════════════════════════════════════════════════════════════════════
-
-def train(
-    X:               np.ndarray,
-    y:               np.ndarray,
-    model_save_path: str   = MODEL_PATH,
-    epochs:          int   = EPOCHS,
-    batch_size:      int   = BATCH_SIZE,
-    val_split:       float = VALIDATION_SPLIT,
-):
-    """
-    Legacy in-memory training (loads all data at once).
-    Use new train.py with VideoDataGenerator for large datasets.
-    """
-    import tensorflow as tf
-
-    os.makedirs(os.path.dirname(model_save_path) or ".", exist_ok=True)
-    model = build_model()
-
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            model_save_path, save_best_only=True,
-            monitor="val_accuracy", verbose=1,
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_accuracy", patience=7,
-            restore_best_weights=True, verbose=1,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5,
-            patience=3, min_lr=1e-6, verbose=1,
-        ),
-    ]
-
-    history = model.fit(
-        X, y,
-        batch_size=batch_size,
-        epochs=epochs,
-        validation_split=val_split,
-        callbacks=callbacks,
-        shuffle=True,
-    )
-    model.save(model_save_path)
-    return model, history
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Inference Wrapper
-# ══════════════════════════════════════════════════════════════════════════════
-
-class GuardNetInference:
-    """
-    Loads a saved .h5 model and runs real-time frame-by-frame inference.
-    Thread-safe — safe to call from background detection threads.
-    """
-
-    def __init__(self, model_path: str = MODEL_PATH):
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"[GuardNet] Model not found: {model_path}\n"
-                "Train first:  python train.py --data_dir ./data --epochs 30"
-            )
-        import tensorflow as tf
-        self.model = tf.keras.models.load_model(model_path)
-
-        # Warm-up pass — compiles TF graph ops
-        dummy = np.zeros((1, SEQUENCE_LENGTH, *FRAME_SIZE, 3), dtype=np.float32)
-        self.model.predict(dummy, verbose=0)
-        print(f"[GuardNet] Model loaded ✓  ({model_path})")
-
-    def predict(self, sequence: np.ndarray) -> float:
-        """
-        Args:
-            sequence : float32  (1, SEQ_LEN, H, W, 3)  normalised [0, 1]
-        Returns:
-            Violence probability  float in [0.0, 1.0]
-        """
-        if sequence.ndim == 4:
-            sequence = sequence[np.newaxis]        # add batch dim
-        preds = self.model.predict(sequence, verbose=0)
-        return float(preds[0, 1])                  # index 1 = violent class

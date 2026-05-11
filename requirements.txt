@@ -1,10 +1,41 @@
-numpy>=1.24
-opencv-python-headless>=4.8
-Pillow>=10.0
-tensorflow-cpu>=2.13
-ultralytics>=8.0
-streamlit>=1.32
-pandas>=2.0
-plotly>=5.18
-python-dotenv>=1.0
-gdown>=4.7
+# GuardNet – Requirements
+# ========================
+# Install: pip install -r requirements.txt
+#
+# Python 3.9 – 3.11 recommended
+# TF 2.13+ supports MobileNetV2 out-of-the-box
+
+# ── Deep learning ────────────────────────────────────────────────────────────
+tensorflow>=2.13.0,<2.16.0      # includes Keras; MobileNetV2 built-in
+# tensorflow-gpu>=2.13.0        # use this line INSTEAD on CUDA-enabled GPUs
+
+# ── Computer vision ──────────────────────────────────────────────────────────
+opencv-python>=4.8.0            # video I/O + display
+opencv-contrib-python>=4.8.0    # extra codecs (optional but recommended)
+
+# ── Numerics ─────────────────────────────────────────────────────────────────
+numpy>=1.24.0,<2.0.0
+scikit-learn>=1.3.0             # stratified split, metrics
+
+# ── Visualisation ────────────────────────────────────────────────────────────
+matplotlib>=3.7.0               # training curve plot
+
+# ── Dashboard (optional) ─────────────────────────────────────────────────────
+streamlit>=1.28.0               # dashboard UI
+plotly>=5.18.0                  # interactive charts in dashboard
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+tqdm>=4.66.0                    # progress bars
+pillow>=10.0.0                  # image utilities
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# GPU acceleration (CUDA):
+#   - Install CUDA 11.8 or 12.x matching your TF version
+#   - Install cuDNN 8.6+
+#   - Replace `tensorflow` with `tensorflow[and-cuda]` on Linux (TF 2.15+)
+#     or install `tensorflow-gpu` separately on Windows
+#
+# Low-memory devices (Raspberry Pi / Jetson Nano):
+#   - Use tflite_runtime instead of tensorflow
+#   - Convert model: tf.lite.TFLiteConverter.from_keras_model(model)
+#   - Set --img_size 96 and --seq_len 8 during training

@@ -193,7 +193,17 @@ MIT – free to use, modify, and distribute.
 
 
 
+# Single webcam
+python demo.py --model models/guardnet_v3.h5
 
+# Two webcams
+python demo.py --model models/guardnet_v3.h5 --cameras 0 1
+
+# CCTV via RTSP
+python demo.py --model models/guardnet_v3.h5 --cameras rtsp://192.168.1.10/stream1
+
+# Faster but less sensitive (skip every 3 frames)
+python demo.py --model models/guardnet_v3.h5 --skip 3 --threshold 0.6
 
 
 
@@ -207,6 +217,8 @@ python -m pip install python-dotenv
 pip install opencv-python
 pip install "numpy<2" 
 python train.py --data_dir ./data --epochs 30
+train.py --data_dir ./data --epochs 30 --batch_size 2
+streamlit run dashboard_production.py
 python demo.py --source 0
 git lfs install
 git lfs track "*.h5"
