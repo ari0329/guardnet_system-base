@@ -1,21 +1,22 @@
 """
-GuardNet – Training Script  (Anti-Overfit + Memory-Safe Edition v3)
+GuardNet – Training Script  (Anti-Overfit + Memory-Safe Edition v4)
 ====================================================================
-Fixes applied
-  Problem 1 – Overfitting / 100 % training accuracy
-    ✓ MobileNetV2 backbone (pretrained, frozen Phase 1)
-    ✓ BatchNorm + Dropout + L2 regularisation (inside model)
-    ✓ Proper 70 / 15 / 15 train / val / test split at VIDEO level
-    ✓ Augmentation applied only to training split
-    ✓ Class-weighted loss (handles minor class imbalance)
-    ✓ EarlyStopping (patience 10, restores best weights)
-    ✓ ReduceLROnPlateau (factor 0.5, patience 4)
-    ✓ Two-phase training: Phase 1 frozen → Phase 2 fine-tune top 30 layers
-    ✓ Final evaluation on held-out TEST set
-    ✓ Training curve plot saved to models/training_curve.png
-
-  Problem 2 – OOM crash
-    ✓ VideoDataGenerator streams data batch-by-batch (no full RAM load)
+Fixes applied in v4 vs v3
+  ✓ Imports from utils.preprocessing (matches project layout) with
+    fallback to direct import so the script works both ways
+  ✓ References GuardNetInference from guardnet_model for consistency
+  ✓ GPU memory-growth enabled before any TF graph construction
+  ✓ All anti-overfit fixes from v3 retained:
+        MobileNetV2 backbone (pretrained, frozen Phase 1)
+        BatchNorm + Dropout + L2 regularisation
+        70 / 15 / 15 train / val / test split at VIDEO level
+        Augmentation applied only to training split
+        Class-weighted loss
+        EarlyStopping (patience 10, restores best weights)
+        ReduceLROnPlateau (factor 0.5, patience 4)
+        Two-phase training: frozen → fine-tune top 30 layers
+        Final evaluation on held-out TEST set
+        Training curve plot saved to models/training_curve.png
 
 Usage:
     python train.py --data_dir ./data --epochs 60
@@ -41,6 +42,7 @@ except ImportError:
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train GuardNet violence detector")
     p.add_argument("--data_dir",   default=DATA_DIR)
@@ -63,6 +65,7 @@ def parse_args():
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
+
 def save_training_plot(all_history: list, out_path: str):
     """Save accuracy + loss curves. Uses matplotlib if available."""
     try:
@@ -78,14 +81,20 @@ def save_training_plot(all_history: list, out_path: str):
         ):
             for ph_idx, hist in enumerate(all_history):
                 label_prefix = f"Phase {ph_idx + 1} "
-                x_offset = sum(len(h.history[metric]) for h in all_history[:ph_idx])
+                x_offset = sum(
+                    len(h.history[metric]) for h in all_history[:ph_idx]
+                )
                 xs = range(x_offset, x_offset + len(hist.history[metric]))
-                axes[ax_idx].plot(xs, hist.history[metric],
-                                  label=label_prefix + "train",
-                                  color=colours[ph_idx], linestyle="-")
-                axes[ax_idx].plot(xs, hist.history[f"val_{metric}"],
-                                  label=label_prefix + "val",
-                                  color=colours[ph_idx], linestyle="--")
+                axes[ax_idx].plot(
+                    xs, hist.history[metric],
+                    label=label_prefix + "train",
+                    color=colours[ph_idx], linestyle="-",
+                )
+                axes[ax_idx].plot(
+                    xs, hist.history[f"val_{metric}"],
+                    label=label_prefix + "val",
+                    color=colours[ph_idx], linestyle="--",
+                )
             axes[ax_idx].set_xlabel("Epoch")
             axes[ax_idx].set_ylabel(ylabel)
             axes[ax_idx].set_title(f"GuardNet – {ylabel}")
@@ -102,12 +111,13 @@ def save_training_plot(all_history: list, out_path: str):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     args = parse_args()
     random.seed(args.seed)
 
     print("=" * 68)
-    print("  GuardNet v3 — Anti-Overfit + Memory-Safe Training Pipeline")
+    print("  GuardNet v4 — Anti-Overfit + Memory-Safe Training Pipeline")
     print("=" * 68)
     print(f"  Data dir    : {args.data_dir}")
     print(f"  Model out   : {args.model_out}")
@@ -122,7 +132,9 @@ def main():
     import tensorflow as tf
     tf.random.set_seed(args.seed)
 
-    # Allow GPU memory growth (prevents OOM on low-VRAM GPUs)
+    # GPU memory growth must be set BEFORE any tensor operations.
+    # This is also set in guardnet_model.py on import, but doing it here
+    # too ensures it is applied even if the model module is imported lazily.
     for gpu in tf.config.list_physical_devices("GPU"):
         try:
             tf.config.experimental.set_memory_growth(gpu, True)
@@ -131,10 +143,24 @@ def main():
 
     gpus = tf.config.list_physical_devices("GPU")
     print(f"\n  TF {tf.__version__} | GPUs detected: {len(gpus)}")
+    if gpus:
+        print(f"  GPU(s): {[g.name for g in gpus]}")
+    else:
+        print("  Running on CPU — inference will be slower. "
+              "Consider a GPU for multi-camera production use.")
 
     # ── Step 1: Scan dataset ──────────────────────────────────────────────────
     print("\n[Step 1/5]  Scanning dataset …")
-    from utils.preprocessing import scan_dataset, three_way_split, VideoDataGenerator
+
+    # Try project-layout import first, fall back to direct import
+    try:
+        from utils.preprocessing import (
+            scan_dataset, three_way_split, VideoDataGenerator,
+        )
+    except ImportError:
+        from preprocessing import (
+            scan_dataset, three_way_split, VideoDataGenerator,
+        )
 
     paths, labels = scan_dataset(args.data_dir)
     total = len(paths)
@@ -145,7 +171,6 @@ def main():
     print(f"  Violence       : {n_vio}")
     print(f"  Non-violence   : {n_nv}")
 
-    # Dataset size warnings
     if total < 6:
         print("\n  [ERROR] Need at least 6 clips to create all 3 splits. Aborting.")
         sys.exit(1)
@@ -154,7 +179,7 @@ def main():
         sys.exit(1)
     if total < 100:
         print(
-            "\n  [WARN] Very small dataset – model WILL overfit regardless of "
+            "\n  [WARN] Very small dataset — model WILL overfit regardless of "
             "technique. Aim for ≥500 clips per class for reliable results.\n"
             "  Proceeding with maximum regularisation …"
         )
@@ -168,10 +193,10 @@ def main():
     )
 
     print(f"  Train : {len(train_paths)} clips")
-    print(f"  Val   : {len(val_paths)}  clips")
+    print(f"  Val   : {len(val_paths)} clips")
     print(f"  Test  : {len(test_paths)} clips (held-out, evaluated AFTER training)")
 
-    # ── Verify no leakage ─────────────────────────────────────────────────────
+    # Verify no leakage
     train_set = set(train_paths)
     val_set   = set(val_paths)
     test_set  = set(test_paths)
@@ -183,40 +208,41 @@ def main():
             f"Train∩Val={len(overlap_tv)}, Train∩Test={len(overlap_tt)}. Aborting."
         )
         sys.exit(1)
-    print("  ✓ No frame overlap detected between splits.")
+    print("  No frame overlap detected between splits.")
 
-    # ── Generators ───────────────────────────────────────────────────────────
-    gen_kwargs = dict(batch_size=args.batch_size,
-                      seq_len=args.seq_len,
-                      img_h=args.img_size,
-                      img_w=args.img_size)
+    # ── Generators ────────────────────────────────────────────────────────────
+    gen_kwargs = dict(
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        img_h=args.img_size,
+        img_w=args.img_size,
+    )
 
     train_gen = VideoDataGenerator(
         train_paths, train_labels,
         shuffle=True,
-        augment=True,   # ← augmentation ONLY on training data
+        augment=True,   # augmentation ONLY on training data
         **gen_kwargs,
     )
     val_gen = VideoDataGenerator(
         val_paths, val_labels,
-        shuffle=False,
-        augment=False,
-        **gen_kwargs,
+        shuffle=False, augment=False, **gen_kwargs,
     )
     test_gen = VideoDataGenerator(
         test_paths, test_labels,
-        shuffle=False,
-        augment=False,
-        **gen_kwargs,
+        shuffle=False, augment=False, **gen_kwargs,
     )
 
-    # Class weights (handles imbalance)
     class_weight = train_gen.class_weights()
     print(f"\n  Class weights: {class_weight}")
 
     # ── Step 3: Build model ───────────────────────────────────────────────────
     print("\n[Step 3/5]  Building model …")
-    from models.guardnet_model import build_model, unfreeze_top_layers
+
+    try:
+        from models.guardnet_model import build_model, unfreeze_top_layers
+    except ImportError:
+        from guardnet_model import build_model, unfreeze_top_layers
 
     model = build_model(
         seq_len=args.seq_len,
@@ -232,7 +258,7 @@ def main():
     # ── Step 4: Train ─────────────────────────────────────────────────────────
     print("\n[Step 4/5]  Training …\n")
 
-    def make_callbacks(monitor_metric="val_accuracy"):
+    def make_callbacks(monitor_metric: str = "val_accuracy"):
         return [
             tf.keras.callbacks.ModelCheckpoint(
                 args.model_out,
@@ -243,7 +269,7 @@ def main():
             ),
             tf.keras.callbacks.EarlyStopping(
                 monitor=monitor_metric,
-                patience=10,                # generous for tiny dataset
+                patience=10,
                 restore_best_weights=True,
                 mode="max",
                 verbose=1,
@@ -263,8 +289,8 @@ def main():
 
     all_histories = []
 
-    # ── Phase 1: frozen backbone ──────────────────────────────────────────────
-    print("  ► Phase 1: frozen MobileNetV2 backbone …")
+    # Phase 1: frozen backbone
+    print("  Phase 1: frozen MobileNetV2 backbone …")
     print("    (Only projection head + LSTM + classifier are trained.)\n")
 
     h1 = model.fit(
@@ -278,12 +304,12 @@ def main():
     )
     all_histories.append(h1)
 
-    # ── Phase 2: fine-tune top backbone layers ────────────────────────────────
-    print("\n  ► Phase 2: fine-tuning top 30 MobileNetV2 layers …")
+    # Phase 2: fine-tune top backbone layers
+    print("\n  Phase 2: fine-tuning top 30 MobileNetV2 layers …")
     print("    (Very small LR to avoid destroying ImageNet weights.)\n")
 
-    model = unfreeze_top_layers(model, num_layers=30, new_lr=args.fine_lr)
-    fine_epochs = max(5, args.epochs // 4)   # short fine-tune pass
+    model      = unfreeze_top_layers(model, num_layers=30, new_lr=args.fine_lr)
+    fine_epochs = max(5, args.epochs // 4)
 
     h2 = model.fit(
         train_gen,
@@ -298,7 +324,9 @@ def main():
 
     # ── Step 5: Evaluate on held-out test set ─────────────────────────────────
     print("\n[Step 5/5]  Evaluating on HELD-OUT test set …")
-    results = model.evaluate(test_gen, verbose=1, workers=1, use_multiprocessing=False)
+    results     = model.evaluate(
+        test_gen, verbose=1, workers=1, use_multiprocessing=False
+    )
     metric_names = model.metrics_names
     result_dict  = dict(zip(metric_names, results))
 
@@ -307,24 +335,23 @@ def main():
         print(f"  {name:<12}: {val:.4f}")
     print("  ─────────────────────────────────────────────────")
 
-    # Save test results to JSON
     result_path = os.path.join(out_dir, "test_results.json")
     with open(result_path, "w") as f:
         json.dump(result_dict, f, indent=2)
     print(f"\n  Test results saved → {result_path}")
 
-    # ── Training curve plot ───────────────────────────────────────────────────
+    # Training curve plot
     if not args.no_plot:
         plot_path = os.path.join(out_dir, "training_curve.png")
         save_training_plot(all_histories, plot_path)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # Summary
     best_val_acc = max(
         max(h.history.get("val_accuracy", [0])) for h in all_histories
     )
 
     print("\n" + "=" * 68)
-    print("  ✓  Training complete!")
+    print("  Training complete!")
     print(f"  Best val accuracy : {best_val_acc * 100:.2f}%")
     print(f"  Test accuracy     : {result_dict.get('accuracy', 0) * 100:.2f}%")
     print(f"  Model saved       : {args.model_out}")
@@ -338,38 +365,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ── Overfitting FAQ (printed when run with --help) ─────────────────────────
-"""
-═══════════════════ WHY WAS ACCURACY 100%? ═══════════════════════════════════
-
-1. Dataset too small for the model's capacity
-   201 clips → the old deep CNN + large LSTM had far more parameters than
-   training examples. The model memorised each clip's pixel patterns.
-   FIX: MobileNetV2 backbone (pretrained) + reduced LSTM (64→32 units).
-
-2. No proper train/val separation at video level
-   If "fight_001.mp4" → train and "fight_002.mp4" → val but both came from
-   the same source video, the model 'cheats' by recognising background/actors.
-   FIX: three_way_split() groups clips by video stem before splitting.
-
-3. Data Augmentation missing / misapplied
-   Without augmentation, the model sees the exact same pixel pattern every
-   epoch and memorises it by epoch 5-10.
-   FIX: Horizontal flip, brightness/contrast jitter, Gaussian noise, crop.
-
-4. No regularisation
-   No Dropout, no L2 → weights grew unconstrained → memorised noise.
-   FIX: Dropout(0.4/0.5) + L2(1e-4) on every Dense + LSTM layer.
-
-5. LR too high / no LR schedule
-   High constant LR lets the model overfit fast in early epochs.
-   FIX: ReduceLROnPlateau halves LR after 4 epochs without val_loss improvement.
-
-6. Too many epochs
-   Training for 100+ epochs on 201 clips guarantees overfit.
-   FIX: EarlyStopping with patience=10 stops when val_accuracy plateaus.
-
-══════════════════════════════════════════════════════════════════════════════
-"""
