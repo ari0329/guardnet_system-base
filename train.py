@@ -40,6 +40,11 @@ except ImportError:
     MODEL_PATH = "models/guardnet_v3.h5"
     EPOCHS     = 60
 
+# Threshold used at inference time — 20% catches minimal / early violence.
+# The model is still trained with binary cross-entropy; threshold only affects
+# the is_violent decision gate in the dashboard / demo, not the training loss.
+VIOLENCE_THRESHOLD: float = float(os.getenv("VIOLENCE_THRESHOLD", "0.20"))
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -322,7 +327,7 @@ def main():
     )
     all_histories.append(h2)
 
-    # ── Step 5: Evaluate on held-out test set ─────────────────────────────────
+    # Step 5: Evaluate on held-out test set ─────────────────────────────────
     print("\n[Step 5/5]  Evaluating on HELD-OUT test set …")
     results     = model.evaluate(
         test_gen, verbose=1, workers=1, use_multiprocessing=False
