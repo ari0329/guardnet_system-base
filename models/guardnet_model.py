@@ -146,7 +146,7 @@ def build_model(
     x   = layers.Dropout(0.5, name="fc_drop")(x)
     out = layers.Dense(1, activation="sigmoid", name="output")(x)
 
-    model = Model(inp, out, name="GuardNet_v3")
+    model = Model(inp, out, name="GuardNet_model")
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss="binary_crossentropy",
@@ -238,7 +238,7 @@ class GuardNetInference:
     Usage
     -----
         # In the inference thread:
-        inferencer = GuardNetInference("models/guardnet_v3.h5")
+        inferencer = GuardNetInference("models/guardnet_model.h5")
         prob = inferencer.predict(seq_array)   # seq_array: [1,16,112,112,3]
     """
 
